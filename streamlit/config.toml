@@ -1,0 +1,10 @@
+[theme]
+base="dark"
+primaryColor="#ff4b4b"
+
+backgroundColor="#0f172a"           # azul oscuro, no negro puro
+secondaryBackgroundColor="#1e293b"  # bloques más claros
+
+textColor="#f1f5f9"                 # BLANCO real legible
+
+font="sans serif"

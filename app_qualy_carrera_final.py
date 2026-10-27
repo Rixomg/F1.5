@@ -1,20 +1,19 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+import os
 import pickle
-#st.markdown('<div class="zona_especial">', unsafe_allow_html=True)
-#st.write("Este texto tendrá otra fuente")
-#st.markdown('</div>', unsafe_allow_html=True)
+import unicodedata
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
+
 st.set_page_config(layout="wide")
 
-# --- Cargar datos y modelos ---
+PONDERACIONES = [0, 25, 18, 15, 12, 10, 8, 6, 4]
+PUNTOS_F1 = [10, 8, 6, 5, 4, 3, 2, 1]
+URL_GPT = "https://chatgpt.com/g/g-6824ad0751a481918919c57574db29b3-narrador-f1"
 
 # --- Cargar datos y modelos ---
-df_race = pd.read_csv("df2.csv", parse_dates=["RACE_DATE"])
-df_qualy = pd.read_csv("df_qualy2.csv", parse_dates=["GP_DATE"])
-df_drivers = pd.read_csv("df_drivers.csv")
-df_constructors = pd.read_csv("df_constructors.csv")
-import unicodedata
 
 def arreglar_texto_mojibake(txt):
     if pd.isna(txt):
@@ -23,20 +22,12 @@ def arreglar_texto_mojibake(txt):
     # Intenta reparar textos mal decodificados tipo "AutÃ³dromo" o "NÃ¼rburgring"
     try:
         txt = txt.encode("latin1").decode("utf-8")
-    except:
+    except UnicodeError:
         pass
     # Normaliza los caracteres Unicode para evitar rarezas visuales
     txt = unicodedata.normalize("NFC", txt)
-    # Reemplazos manuales de los circuitos que sabes que salen mal
+    # Por si alguna variante sigue viniendo rota
     reemplazos = {
-        "Autódromo Hermanos Rodríguez": "Autódromo Hermanos Rodríguez",
-        "Autódromo Internacional Nelson Piquet": "Autódromo Internacional Nelson Piquet",
-        "Autódromo Internacional do Algarve": "Autódromo Internacional do Algarve",
-        "Autódromo José Carlos Pace": "Autódromo José Carlos Pace",
-        "Autódromo Juan y Oscar Gálvez": "Autódromo Juan y Oscar Gálvez",
-        "Autódromo do Estoril": "Autódromo do Estoril",
-        "Nürburgring": "Nürburgring",
-        # Por si alguna variante sigue viniendo rota
         "AutÃ³dromo Hermanos RodrÃ­guez": "Autódromo Hermanos Rodríguez",
         "AutÃ³dromo Internacional Nelson Piquet": "Autódromo Internacional Nelson Piquet",
         "AutÃ³dromo Internacional do Algarve": "Autódromo Internacional do Algarve",
@@ -49,12 +40,86 @@ def arreglar_texto_mojibake(txt):
     # Limpieza final de espacios raros
     txt = " ".join(txt.split())
     return txt
-df_race["CIRCUIT_NAME"] = df_race["CIRCUIT_NAME"].apply(arreglar_texto_mojibake)
-df_qualy["CIRCUIT_NAME"] = df_qualy["CIRCUIT_NAME"].apply(arreglar_texto_mojibake)
-with open("DetGrid2.pkl", "rb") as f:
-    model_qualy = pickle.load(f)
-with open("formula1_top88_model.pkl", "rb") as f:
-    model_carrera = pickle.load(f)
+
+@st.cache_data
+def cargar_datos():
+    df_race = pd.read_csv("df2.csv", parse_dates=["RACE_DATE"])
+    df_qualy = pd.read_csv("df_qualy2.csv", parse_dates=["GP_DATE"])
+    df_drivers = pd.read_csv("df_drivers.csv")
+    df_constructors = pd.read_csv("df_constructors.csv")
+    df_race["CIRCUIT_NAME"] = df_race["CIRCUIT_NAME"].apply(arreglar_texto_mojibake)
+    df_qualy["CIRCUIT_NAME"] = df_qualy["CIRCUIT_NAME"].apply(arreglar_texto_mojibake)
+    # Año precalculado para no repetir .dt.year en cada filtro
+    df_race["YEAR"] = df_race["RACE_DATE"].dt.year
+    df_qualy["YEAR"] = df_qualy["GP_DATE"].dt.year
+    return df_race, df_qualy, df_drivers, df_constructors
+
+@st.cache_resource
+def cargar_modelos():
+    with open("DetGrid2.pkl", "rb") as f:
+        model_qualy = pickle.load(f)
+    with open("formula1_top88_model.pkl", "rb") as f:
+        model_carrera = pickle.load(f)
+    return model_qualy, model_carrera
+
+df_race, df_qualy, df_drivers, df_constructors = cargar_datos()
+model_qualy, model_carrera = cargar_modelos()
+
+driver_id_por_ref = df_drivers.drop_duplicates("DRIVERREF").set_index("DRIVERREF")["DRIVER_ID"].to_dict()
+constructor_id_por_nombre = (
+    df_constructors.dropna(subset=["NAME#"])
+    .drop_duplicates("NAME#")
+    .set_index("NAME#")["CONSTRUCTOR_ID"]
+    .to_dict()
+)
+
+@st.cache_data
+def calcular_anios_validos(col_id):
+    """
+    {id: [años]} con los años en los que hay datos tanto de carrera como de qualy.
+    col_id: "DRIVER_ID" o "CONSTRUCTOR_ID".
+    """
+    anios_race = df_race.groupby(col_id)["YEAR"].agg(set)
+    anios_qualy = df_qualy.groupby(col_id)["YEAR"].agg(set)
+    comunes = anios_race.index.intersection(anios_qualy.index)
+    return {k: sorted(int(a) for a in anios_race[k] & anios_qualy[k]) for k in comunes}
+
+@st.cache_data
+def preparar_tablas():
+    """
+    Tablas de consulta precalculadas para no filtrar los DataFrames completos en cada simulación.
+    """
+    race = df_race.sort_values("RACE_DATE", kind="stable")
+    qualy = df_qualy.sort_values("GP_DATE", kind="stable")
+    tablas = {}
+    # Última carrera/qualy de cada piloto y escudería en cada año
+    for nombre, df, col_id in [
+        ("race_piloto", race, "DRIVER_ID"),
+        ("race_ct", race, "CONSTRUCTOR_ID"),
+        ("qualy_piloto", qualy, "DRIVER_ID"),
+        ("qualy_ct", qualy, "CONSTRUCTOR_ID"),
+    ]:
+        tablas[nombre] = df.groupby([col_id, "YEAR"]).tail(1).set_index([col_id, "YEAR"])
+    # Afinidad piloto-circuito: primera aparición en el fichero
+    for nombre, df, col in [("afinidad_race", df_race, "AFINIDAD3"), ("afinidad_qualy", df_qualy, "AFINIDAD_QUALY_3")]:
+        df = df.assign(CIRCUIT_LOWER=df["CIRCUIT_NAME"].str.lower())
+        tablas[nombre] = df.drop_duplicates(["DRIVER_ID", "CIRCUIT_LOWER"]).set_index(["DRIVER_ID", "CIRCUIT_LOWER"])[col]
+    # Afinidad en lluvia real: primera carrera con lluvia de ese piloto en ese año
+    lluvia = df_race[
+        (df_race["LLUVIA"] == 1) &
+        (df_race["AFINIDAD_LLUVIA_REAL"].notna()) &
+        (df_race["AFINIDAD_LLUVIA_REAL"] > 0)
+    ]
+    tablas["afinidad_lluvia"] = lluvia.drop_duplicates(["DRIVER_ID", "YEAR"]).set_index(["DRIVER_ID", "YEAR"])["AFINIDAD_LLUVIA_REAL"]
+    return tablas
+
+tablas = preparar_tablas()
+
+def buscar_fila(tabla, clave, descripcion):
+    try:
+        return tabla.loc[clave]
+    except KeyError:
+        raise KeyError(f"no hay datos de {descripcion}") from None
 
 # --- Inicializar estado ---
 if 'poles' not in st.session_state:
@@ -71,11 +136,6 @@ if 'carrera_actual' not in st.session_state:
     st.session_state.carrera_actual = 0
 if 'historial_carreras' not in st.session_state:
     st.session_state.historial_carreras = []
-if 'clasificacion_mundial' not in st.session_state:
-    st.session_state.clasificacion_mundial = {}
-
-def obtener_cronica_desde_gpt(prompt):
-    return "Este es un espacio reservado para la crónica automática. Copia el siguiente prompt y pégalo en tu GPT personalizado:\n\n" + prompt
 
 def generar_prompt_presentacion(pilotos_config):
     texto = "### Presentación del Campeonato de F1 Simulado\n\n"
@@ -89,26 +149,6 @@ def generar_prompt_presentacion(pilotos_config):
     texto += "\nEscribe una presentación con tono narrativo deportivo: destaca quiénes parten como favoritos, quiénes podrían sorprender, y qué combinaciones parecen más arriesgadas o desequilibradas. Añade emoción y expectativas para la temporada."
     return texto
 
-def obtener_anios_piloto(driver_ref):
-    try:
-        driver_id = df_drivers[df_drivers['DRIVERREF'] == driver_ref]['DRIVER_ID'].iloc[0]
-        years_piloto = sorted(
-            df_race[df_race['DRIVER_ID'] == driver_id]['RACE_DATE'].dt.year.unique()
-        )
-        return years_piloto
-    except:
-        return []
-
-def obtener_anios_constructor(constructor_name):
-    try:
-        constructor_id = df_constructors[df_constructors['NAME#'] == constructor_name]['CONSTRUCTOR_ID'].iloc[0]
-        years_constructor = sorted(
-            df_race[df_race['CONSTRUCTOR_ID'] == constructor_id]['RACE_DATE'].dt.year.unique()
-        )
-        return years_constructor
-    except:
-        return []
-
 # --- Función: generar features para clasificación (Qualy) ---
 
 def generar_features_qualy(pilotos_config, circuito):
@@ -117,21 +157,13 @@ def generar_features_qualy(pilotos_config, circuito):
         if not piloto or not config['constructor']:
             continue
         try:
-            driver_id = df_drivers[df_drivers['DRIVERREF'] == piloto]['DRIVER_ID'].iloc[0]
-            constructor_id = df_constructors[df_constructors['NAME#'].str.lower() == config['constructor'].lower()]['CONSTRUCTOR_ID'].iloc[0]
-            driver_data = df_qualy[
-                (df_qualy['DRIVER_ID'] == driver_id) &
-                (df_qualy['GP_DATE'].dt.year == config['anio_piloto'])
-            ].sort_values(by="GP_DATE").iloc[-1]
-            constructor_data = df_qualy[
-                (df_qualy['CONSTRUCTOR_ID'] == constructor_id) &
-                (df_qualy['GP_DATE'].dt.year == config['anio_constructor'])
-            ].sort_values(by="GP_DATE").iloc[-1]
-            afinidad_series = df_qualy[
-                (df_qualy['DRIVER_ID'] == driver_id) &
-                (df_qualy['CIRCUIT_NAME'].str.lower() == circuito.lower())
-            ]['AFINIDAD_QUALY_3']
-            afinidad_qualy = afinidad_series.iloc[0] if not afinidad_series.empty else 0.5
+            driver_id = driver_id_por_ref[piloto]
+            constructor_id = constructor_id_por_nombre[config['constructor']]
+            driver_data = buscar_fila(tablas["qualy_piloto"], (driver_id, config['anio_piloto']),
+                                      f"qualy de {piloto} en {config['anio_piloto']}")
+            constructor_data = buscar_fila(tablas["qualy_ct"], (constructor_id, config['anio_constructor']),
+                                           f"qualy de {config['constructor']} en {config['anio_constructor']}")
+            afinidad_qualy = tablas["afinidad_qualy"].get((driver_id, circuito.lower()), 0.5)
             rows.append({
                 'PILOTO': piloto,
                 'QUALY_PERFORMANCE': driver_data['QUALY_PERFORMANCE'],
@@ -171,48 +203,20 @@ def generar_prompt_para_gpt(carrera):
 
 def simular_carrera(pilotos_config, circuito, lluvia, grid_ordenado, neutro=False):
     rows = []
-    debug_info = []
     for pos, piloto in enumerate(grid_ordenado, start=1):
         try:
             config = pilotos_config[piloto]
             anio_piloto = int(config['anio_piloto'])  # 🔐 asegurar tipo
             anio_constructor = int(config['anio_constructor'])
-            driver_id = df_drivers[df_drivers['DRIVERREF'] == piloto]['DRIVER_ID'].iloc[0]
-            constructor_id = df_constructors[df_constructors['NAME#'] == config['constructor']]['CONSTRUCTOR_ID'].iloc[0]
-            driver_data = df_race[
-                (df_race['DRIVER_ID'] == driver_id) &
-                (df_race['RACE_DATE'].dt.year == anio_piloto)
-            ].sort_values(by="RACE_DATE").iloc[-1]
-            constructor_data = df_race[
-                (df_race['CONSTRUCTOR_ID'] == constructor_id) &
-                (df_race['RACE_DATE'].dt.year == anio_constructor)
-            ].sort_values(by="RACE_DATE").iloc[-1]
-            afinidad_row = df_race[
-                (df_race['DRIVER_ID'] == driver_id) &
-                (df_race['CIRCUIT_NAME'].str.lower() == circuito.lower())
-            ]
-            afinidad = afinidad_row['AFINIDAD3'].iloc[0] if not afinidad_row.empty else 0.5
-            # Filtrar carreras con lluvia EN ESE AÑO
-            driver_year_lluvia = df_race[
-                (df_race['DRIVER_ID'] == driver_id) &
-                (df_race['RACE_DATE'].dt.year == anio_piloto) &
-                (df_race['LLUVIA'] == 1) &
-                (df_race['AFINIDAD_LLUVIA_REAL'].notna()) &
-                (df_race['AFINIDAD_LLUVIA_REAL'] > 0)
-            ]
-            afinidad_lluvia_real = (
-                driver_year_lluvia['AFINIDAD_LLUVIA_REAL'].iloc[0]
-                if not driver_year_lluvia.empty else 0
-            )
-            # ✅ Añadir info de debug
-            debug_info.append({
-                "Piloto": piloto,
-                "Driver_ID": driver_id,
-                "Año seleccionado": anio_piloto,
-                "Carreras con lluvia en ese año": len(driver_year_lluvia),
-                "AFINIDAD_LLUVIA_REAL usada": afinidad_lluvia_real,
-                "¿Llueve en esta carrera?": lluvia
-            })
+            driver_id = driver_id_por_ref[piloto]
+            constructor_id = constructor_id_por_nombre[config['constructor']]
+            driver_data = buscar_fila(tablas["race_piloto"], (driver_id, anio_piloto),
+                                      f"carrera de {piloto} en {anio_piloto}")
+            constructor_data = buscar_fila(tablas["race_ct"], (constructor_id, anio_constructor),
+                                           f"carrera de {config['constructor']} en {anio_constructor}")
+            afinidad = tablas["afinidad_race"].get((driver_id, circuito.lower()), 0.5)
+            # Afinidad con lluvia EN ESE AÑO
+            afinidad_lluvia_real = tablas["afinidad_lluvia"].get((driver_id, anio_piloto), 0)
             rows.append({
                 'PILOTO': piloto,
                 'GRID': pos,
@@ -227,15 +231,12 @@ def simular_carrera(pilotos_config, circuito, lluvia, grid_ordenado, neutro=Fals
             })
         except Exception as e:
             st.warning(f"⚠️ Error con {piloto}: {e}")
-            debug_info.append({
-                "Piloto": piloto,
-                "Error": str(e)
-            })
             continue
+    if not rows:
+        return []
     df_features = pd.DataFrame(rows)
     X = df_features.drop(columns="PILOTO")
     probs = model_carrera.predict_proba(X)
-    ponderaciones = [0, 25, 18, 15, 12, 10, 8, 6, 4]
     pesos_grid_por_circuito = {
         "Circuit de Monaco": 5, "Hungaroring": 1, "Autodromo Enzo e Dino Ferrari": 0.5,
         "Circuit de Barcelona-Catalunya": 0.5, "Albert Park Grand Prix Circuit": 0.5,
@@ -245,9 +246,9 @@ def simular_carrera(pilotos_config, circuito, lluvia, grid_ordenado, neutro=Fals
     factor_global_grid = 1.55
     resultados = []
     for i, row in df_features.iterrows():
-        base_score = sum(ponderaciones[j] * probs[i][j] for j in range(len(ponderaciones)))
+        base_score = sum(PONDERACIONES[j] * probs[i][j] for j in range(len(PONDERACIONES)))
         if neutro:
-            factor=1
+            factor = 1
         else:
             if row['LLUVIA']:
                 factor = (
@@ -267,9 +268,11 @@ def simular_carrera(pilotos_config, circuito, lluvia, grid_ordenado, neutro=Fals
         resultados.append((final_score, row['PILOTO']))
     resultados.sort(reverse=True)
     return resultados
+
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Orbitron:wght@500;700&family=Bebas+Neue&family=Rajdhani:wght@400;500;600;700&family=Oswald:wght@400;500;600;700&family=Teko:wght@400;500;600;700&family=Barlow+Condensed:wght@400;600;700&family=Exo+2:wght@400;600;700&family=Chakra+Petch:wght@400;500;600;700&family=Titillium+Web:wght@400;600;700&family=Anton&family=Russo+One&family=Montserrat:wght@400;600;700&family=Poppins:wght@400;600;700&family=Roboto+Condensed:wght@400;700&family=Oxanium:wght@400;600;700&family=Audiowide&family=Jura:wght@400;600;700&family=Kanit:wght@400;600;700&family=Manrope:wght@400;600;700&family=Archivo:wght@400;600;700&family=Saira+Condensed:wght@400;600;700&family=Prompt:wght@400;600;700&family=Space+Grotesk:wght@400;500;700&display=swap');
+/* Si pruebas una fuente nueva en las variables de abajo, añádela también a este @import */
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Jura:wght@400;600;700&family=Oxanium:wght@400;600;700&family=Bebas+Neue&family=Space+Grotesk:wght@400;500;700&display=swap');
 /* =========================================================
    CAMBIA SOLO ESTAS 3 LÍNEAS PARA PROBAR FUENTES
    ========================================================= */
@@ -367,7 +370,6 @@ div[data-testid="stSelectbox"] [data-baseweb="select"] span {
     opacity: 1 !important;
 }
 
-}
 /* =========================================================
    DROPDOWN ABIERTO / MENÚ DE OPCIONES
    ========================================================= */
@@ -514,18 +516,11 @@ h2 {
 
 def cargar_8_pilotos_aleatorios():
     rng = np.random.default_rng()
-    # Pilotos con datos válidos tanto en race como en qualy
-    driver_ids_race = set(df_race['DRIVER_ID'].dropna().unique())
-    driver_ids_qualy = set(df_qualy['DRIVER_ID'].dropna().unique())
-    driver_ids_validos = driver_ids_race.intersection(driver_ids_qualy)
-    drivers_validos = df_drivers[df_drivers['DRIVER_ID'].isin(driver_ids_validos)].copy()
-    pilotos_validos = sorted(drivers_validos['DRIVERREF'].dropna().unique().tolist())
-    # Escuderías con datos válidos tanto en race como en qualy
-    constructor_ids_race = set(df_race['CONSTRUCTOR_ID'].dropna().unique())
-    constructor_ids_qualy = set(df_qualy['CONSTRUCTOR_ID'].dropna().unique())
-    constructor_ids_validos = constructor_ids_race.intersection(constructor_ids_qualy)
-    constructors_validos = df_constructors[df_constructors['CONSTRUCTOR_ID'].isin(constructor_ids_validos)].copy()
-    escuderias_validas = sorted(constructors_validos['NAME#'].dropna().unique().tolist())
+    anios_por_piloto = calcular_anios_validos("DRIVER_ID")
+    anios_por_constructor = calcular_anios_validos("CONSTRUCTOR_ID")
+    # Pilotos y escuderías con datos válidos tanto en race como en qualy
+    pilotos_validos = sorted(df_drivers.loc[df_drivers['DRIVER_ID'].isin(anios_por_piloto), 'DRIVERREF'].dropna().unique().tolist())
+    escuderias_validas = sorted(df_constructors.loc[df_constructors['CONSTRUCTOR_ID'].isin(anios_por_constructor), 'NAME#'].dropna().unique().tolist())
     if len(pilotos_validos) < 8:
         st.error("No hay suficientes pilotos válidos para generar una selección aleatoria.")
         return
@@ -533,15 +528,7 @@ def cargar_8_pilotos_aleatorios():
     for i, piloto in enumerate(pilotos_elegidos):
         # Guardar piloto en el widget
         st.session_state[f"piloto_select_{i}"] = piloto
-        # Año válido del piloto (intersección race + qualy)
-        driver_id = df_drivers.loc[df_drivers['DRIVERREF'] == piloto, 'DRIVER_ID'].iloc[0]
-        anios_piloto_race = set(
-            df_race.loc[df_race['DRIVER_ID'] == driver_id, 'RACE_DATE'].dt.year.dropna().astype(int).unique()
-        )
-        anios_piloto_qualy = set(
-            df_qualy.loc[df_qualy['DRIVER_ID'] == driver_id, 'GP_DATE'].dt.year.dropna().astype(int).unique()
-        )
-        anios_piloto_validos = sorted(list(anios_piloto_race.intersection(anios_piloto_qualy)))
+        anios_piloto_validos = anios_por_piloto.get(driver_id_por_ref[piloto], [])
         if not anios_piloto_validos:
             continue
         anio_piloto = int(rng.choice(anios_piloto_validos))
@@ -549,121 +536,83 @@ def cargar_8_pilotos_aleatorios():
         # Escudería aleatoria válida
         constructor = rng.choice(escuderias_validas)
         st.session_state[f"constructor_select_{i}"] = constructor
-        constructor_id = df_constructors.loc[
-            df_constructors['NAME#'] == constructor, 'CONSTRUCTOR_ID'
-        ].iloc[0]
-        anios_constructor_race = set(
-            df_race.loc[df_race['CONSTRUCTOR_ID'] == constructor_id, 'RACE_DATE'].dt.year.dropna().astype(int).unique()
-        )
-        anios_constructor_qualy = set(
-            df_qualy.loc[df_qualy['CONSTRUCTOR_ID'] == constructor_id, 'GP_DATE'].dt.year.dropna().astype(int).unique()
-        )
-        anios_constructor_validos = sorted(list(anios_constructor_race.intersection(anios_constructor_qualy)))
+        anios_constructor_validos = anios_por_constructor.get(constructor_id_por_nombre[constructor], [])
         if not anios_constructor_validos:
             continue
         anio_constructor = int(rng.choice(anios_constructor_validos))
         st.session_state[f"anio_constructor_select_{i}"] = anio_constructor
 
+@st.cache_data
 def construir_pool_equilibrado():
     """
     Pool piloto-año con métricas agregadas.
     """
-    rows = []
-    driver_ids_race = set(df_race['DRIVER_ID'].dropna().unique())
-    driver_ids_qualy = set(df_qualy['DRIVER_ID'].dropna().unique())
-    driver_ids_validos = driver_ids_race.intersection(driver_ids_qualy)
-    for driver_id in driver_ids_validos:
-        df_driver_info = df_drivers[df_drivers['DRIVER_ID'] == driver_id]
-        if df_driver_info.empty:
-            continue
-        piloto = df_driver_info['DRIVERREF'].iloc[0]
-        years_race = set(
-            df_race.loc[df_race['DRIVER_ID'] == driver_id, 'RACE_DATE']
-            .dropna().dt.year.astype(int).unique()
-        )
-        years_qualy = set(
-            df_qualy.loc[df_qualy['DRIVER_ID'] == driver_id, 'GP_DATE']
-            .dropna().dt.year.astype(int).unique()
-        )
-        years_validos = sorted(list(years_race.intersection(years_qualy)))
-        for anio in years_validos:
-            race_year = df_race[
-                (df_race['DRIVER_ID'] == driver_id) &
-                (df_race['RACE_DATE'].dt.year == anio)
-            ].sort_values("RACE_DATE")
-            qualy_year = df_qualy[
-                (df_qualy['DRIVER_ID'] == driver_id) &
-                (df_qualy['GP_DATE'].dt.year == anio)
-            ].sort_values("GP_DATE")
-            if race_year.empty or qualy_year.empty:
-                continue
-            race_last = race_year.iloc[-1]
-            qualy_last = qualy_year.iloc[-1]
-            afinidad_race_validas = race_year['AFINIDAD3'].dropna()
-            afinidad_qualy_validas = qualy_year['AFINIDAD_QUALY_3'].dropna()
-            afinidad_lluvia_validas = race_year.loc[
-                race_year['AFINIDAD_LLUVIA_REAL'].notna() &
-                (race_year['AFINIDAD_LLUVIA_REAL'] > 0),
-                'AFINIDAD_LLUVIA_REAL'
-            ]
-            rows.append({
-                "piloto": piloto,
-                "driver_id": driver_id,
-                "anio_piloto": int(anio),
-                "GENERAL_PERFORMANCE": float(race_last['GENERAL_PERFORMANCE']),
-                "ADJUSTED_PERFORMANCE": float(race_last['ADJUSTED_PERFORMANCE']),
-                "PERFORMANCE_RATIO": float(race_last['PERFORMANCE_RATIO']),
-                "QUALY_PERFORMANCE": float(qualy_last['QUALY_PERFORMANCE']),
-                "media_afinidad_race": float(afinidad_race_validas.mean()) if not afinidad_race_validas.empty else 0.0,
-                "media_afinidad_qualy": float(afinidad_qualy_validas.mean()) if not afinidad_qualy_validas.empty else 0.0,
-                "media_afinidad_lluvia": float(afinidad_lluvia_validas.mean()) if not afinidad_lluvia_validas.empty else 0.0,
-                "n_circuitos_race": int(race_year['CIRCUIT_NAME'].nunique()),
-                "n_circuitos_qualy": int(qualy_year['CIRCUIT_NAME'].nunique())
-            })
-    return pd.DataFrame(rows)
+    claves = ["DRIVER_ID", "YEAR"]
+    race_last = tablas["race_piloto"]
+    qualy_last = tablas["qualy_piloto"]
+    race_g = df_race.groupby(claves)
+    qualy_g = df_qualy.groupby(claves)
+    lluvia_validas = df_race[df_race['AFINIDAD_LLUVIA_REAL'].notna() & (df_race['AFINIDAD_LLUVIA_REAL'] > 0)]
+    pool = pd.DataFrame({
+        "GENERAL_PERFORMANCE": race_last['GENERAL_PERFORMANCE'],
+        "ADJUSTED_PERFORMANCE": race_last['ADJUSTED_PERFORMANCE'],
+        "PERFORMANCE_RATIO": race_last['PERFORMANCE_RATIO'],
+        "media_afinidad_race": race_g['AFINIDAD3'].mean(),
+        "media_afinidad_lluvia": lluvia_validas.groupby(claves)['AFINIDAD_LLUVIA_REAL'].mean(),
+        "n_circuitos_race": race_g['CIRCUIT_NAME'].nunique(),
+    }).join(pd.DataFrame({
+        "QUALY_PERFORMANCE": qualy_last['QUALY_PERFORMANCE'],
+        "media_afinidad_qualy": qualy_g['AFINIDAD_QUALY_3'].mean(),
+        "n_circuitos_qualy": qualy_g['CIRCUIT_NAME'].nunique(),
+    }), how="inner")
+    pool = pool.reset_index().rename(columns={"DRIVER_ID": "driver_id", "YEAR": "anio_piloto"})
+    ref_por_driver_id = df_drivers.drop_duplicates("DRIVER_ID").set_index("DRIVER_ID")["DRIVERREF"]
+    pool = pool[pool["driver_id"].isin(ref_por_driver_id.index)].copy()
+    pool["piloto"] = pool["driver_id"].map(ref_por_driver_id)
+    pool["anio_piloto"] = pool["anio_piloto"].astype(int)
+    medias = ["media_afinidad_race", "media_afinidad_qualy", "media_afinidad_lluvia"]
+    pool[medias] = pool[medias].fillna(0.0)
+    pool[["n_circuitos_race", "n_circuitos_qualy"]] = pool[["n_circuitos_race", "n_circuitos_qualy"]].astype(int)
+    return pool[[
+        "piloto", "driver_id", "anio_piloto",
+        "GENERAL_PERFORMANCE", "ADJUSTED_PERFORMANCE", "PERFORMANCE_RATIO", "QUALY_PERFORMANCE",
+        "media_afinidad_race", "media_afinidad_qualy", "media_afinidad_lluvia",
+        "n_circuitos_race", "n_circuitos_qualy"
+    ]].reset_index(drop=True)
 
+@st.cache_data
 def construir_pool_constructores():
     """
     Pool constructor-año con métricas agregadas.
     """
-    rows = []
-    constructor_ids_race = set(df_race['CONSTRUCTOR_ID'].dropna().unique())
-    constructor_ids_qualy = set(df_qualy['CONSTRUCTOR_ID'].dropna().unique())
-    constructor_ids_validos = constructor_ids_race.intersection(constructor_ids_qualy)
-    for constructor_id in constructor_ids_validos:
-        df_ct_info = df_constructors[df_constructors['CONSTRUCTOR_ID'] == constructor_id]
-        if df_ct_info.empty:
-            continue
-        constructor = df_ct_info['NAME#'].iloc[0]
-        years_race = set(
-            df_race.loc[df_race['CONSTRUCTOR_ID'] == constructor_id, 'RACE_DATE']
-            .dropna().dt.year.astype(int).unique()
-        )
-        years_qualy = set(
-            df_qualy.loc[df_qualy['CONSTRUCTOR_ID'] == constructor_id, 'GP_DATE']
-            .dropna().dt.year.astype(int).unique()
-        )
-        years_validos = sorted(list(years_race.intersection(years_qualy)))
-        for anio in years_validos:
-            race_year = df_race[
-                (df_race['CONSTRUCTOR_ID'] == constructor_id) &
-                (df_race['RACE_DATE'].dt.year == anio)
-            ].sort_values("RACE_DATE")
-            qualy_year = df_qualy[
-                (df_qualy['CONSTRUCTOR_ID'] == constructor_id) &
-                (df_qualy['GP_DATE'].dt.year == anio)
-            ].sort_values("GP_DATE")
-            if race_year.empty or qualy_year.empty:
-                continue
-            race_last = race_year.iloc[-1]
-            qualy_last = qualy_year.iloc[-1]
-            rows.append({
-                "constructor": constructor,
-                "anio_constructor": int(anio),
-                "CONSTRUCTOR_PERFORMANCE": float(race_last['CONSTRUCTOR_PERFORMANCE']),
-                "CT_QUALY_PERFORMANCE": float(qualy_last['CT_QUALY_PERFORMANCE'])
-            })
-    return pd.DataFrame(rows)
+    pool = tablas["race_ct"][['CONSTRUCTOR_PERFORMANCE']].join(
+        tablas["qualy_ct"][['CT_QUALY_PERFORMANCE']], how="inner"
+    ).reset_index()
+    nombre_por_ct_id = df_constructors.drop_duplicates("CONSTRUCTOR_ID").set_index("CONSTRUCTOR_ID")["NAME#"]
+    pool = pool[pool["CONSTRUCTOR_ID"].isin(nombre_por_ct_id.index)].copy()
+    pool["constructor"] = pool["CONSTRUCTOR_ID"].map(nombre_por_ct_id)
+    pool["anio_constructor"] = pool["YEAR"].astype(int)
+    return pool[["constructor", "anio_constructor", "CONSTRUCTOR_PERFORMANCE", "CT_QUALY_PERFORMANCE"]].reset_index(drop=True)
+
+def construir_combinaciones(pool_pilotos, pool_ct):
+    """
+    Todas las combinaciones piloto-coche con su score equilibrado.
+    """
+    df_combo = pool_pilotos[['piloto', 'anio_piloto', 'score_piloto']].merge(
+        pool_ct[['constructor', 'anio_constructor', 'score_coche']], how="cross"
+    )
+    sp = df_combo['score_piloto']
+    sc = df_combo['score_coche']
+    # Score base combinación
+    score_combo = 0.65 * sp + 0.35 * sc
+    # Penalización si ambos están demasiado arriba a la vez
+    penalizacion_top = 0.18 * ((sp - 0.75).clip(lower=0) + (sc - 0.75).clip(lower=0))
+    # Penalización si ambos están demasiado abajo a la vez
+    penalizacion_bajo = 0.10 * ((0.45 - sp).clip(lower=0) + (0.45 - sc).clip(lower=0))
+    # Penalización por desequilibrio exagerado entre piloto y coche
+    penalizacion_gap = 0.12 * ((sp - sc).abs() - 0.22).clip(lower=0)
+    df_combo['score_combo'] = score_combo - penalizacion_top - penalizacion_bajo - penalizacion_gap
+    return df_combo
 
 def normalizar_columna(df, col):
     min_v = df[col].min()
@@ -672,31 +621,17 @@ def normalizar_columna(df, col):
         return pd.Series([0.5] * len(df), index=df.index)
     return (df[col] - min_v) / (max_v - min_v)
 
-def seleccionar_bloque_compacto(df, score_col, n=8, top_k=5):
-    """
-    Elige un bloque de n filas consecutivas en score ordenado con poca dispersión.
-    Introduce algo de aleatoriedad escogiendo entre los mejores bloques.
-    """
-    rng = np.random.default_rng()
-    df_sorted = df.sort_values(score_col).reset_index(drop=True)
-    if len(df_sorted) <= n:
-        return df_sorted.copy()
-    candidatos = []
-    for i in range(len(df_sorted) - n + 1):
-        bloque = df_sorted.iloc[i:i+n].copy()
-        spread = bloque[score_col].max() - bloque[score_col].min()
-        std = bloque[score_col].std()
-        score_compacidad = spread + std
-        candidatos.append((score_compacidad, i, bloque))
-    candidatos = sorted(candidatos, key=lambda x: x[0])
-    top_k = min(top_k, len(candidatos))
-    elegido = candidatos[rng.integers(0, top_k)][2]
-    return elegido.copy()
-
-def sample_tier(df, n_objetivo):
-    if df.empty or n_objetivo <= 0:
-        return df.iloc[0:0].copy()
-    return df.sample(n=min(n_objetivo, len(df)), replace=False)
+def elegir_sin_repetir(candidatos, seleccion, pilotos_usados, constructores_usados, n=8):
+    for _, row in candidatos.iterrows():
+        if row['piloto'] in pilotos_usados:
+            continue
+        if row['constructor'] in constructores_usados:
+            continue
+        seleccion.append(row)
+        pilotos_usados.add(row['piloto'])
+        constructores_usados.add(row['constructor'])
+        if len(seleccion) == n:
+            break
 
 def cargar_8_pilotos_equilibrados():
     rng = np.random.default_rng()
@@ -708,7 +643,6 @@ def cargar_8_pilotos_equilibrados():
     # =========================================================
     # 1) FILTRO PILOTOS: ÉLITE EQUILIBRADA
     # =========================================================
-    pool_pilotos = pool_pilotos.copy()
     # Capar outliers absurdos
     pool_pilotos['PERFORMANCE_RATIO_CLIP'] = pool_pilotos['PERFORMANCE_RATIO'].clip(lower=0, upper=22)
     pool_pilotos = pool_pilotos[
@@ -758,7 +692,6 @@ def cargar_8_pilotos_equilibrados():
     # =========================================================
     # 2) FILTRO COCHES: BUENOS PERO NO ROTOS
     # =========================================================
-    pool_ct = pool_ct.copy()
     pool_ct = pool_ct[
         (pool_ct['CONSTRUCTOR_PERFORMANCE'] >= 8) &
         (pool_ct['CONSTRUCTOR_PERFORMANCE'] <= 22) &
@@ -790,51 +723,23 @@ def cargar_8_pilotos_equilibrados():
     # =========================================================
     # 3) SCORE DE COMBINACIÓN PILOTO + COCHE
     # =========================================================
-    combinaciones = []
-    for _, p_row in pool_pilotos.iterrows():
-        for _, c_row in pool_ct.iterrows():
-            # Score base combinación
-            score_combo = (
-                0.65 * p_row['score_piloto'] +
-                0.35 * c_row['score_coche']
-            )
-            # Penalización si ambos están demasiado arriba a la vez
-            exceso_top = max(0, p_row['score_piloto'] - 0.75) + max(0, c_row['score_coche'] - 0.75)
-            penalizacion_top = 0.18 * exceso_top
-            # Penalización si ambos están demasiado abajo a la vez
-            defecto = max(0, 0.45 - p_row['score_piloto']) + max(0, 0.45 - c_row['score_coche'])
-            penalizacion_bajo = 0.10 * defecto
-            # Penalización por desequilibrio exagerado entre piloto y coche
-            gap_pc = abs(p_row['score_piloto'] - c_row['score_coche'])
-            penalizacion_gap = 0.12 * max(0, gap_pc - 0.22)
-            score_final = score_combo - penalizacion_top - penalizacion_bajo - penalizacion_gap
-            combinaciones.append({
-                "piloto": p_row['piloto'],
-                "anio_piloto": int(p_row['anio_piloto']),
-                "score_piloto": float(p_row['score_piloto']),
-                "constructor": c_row['constructor'],
-                "anio_constructor": int(c_row['anio_constructor']),
-                "score_coche": float(c_row['score_coche']),
-                "score_combo": float(score_final)
-            })
-    df_combo = pd.DataFrame(combinaciones)
-    if df_combo.empty:
+    todas_combinaciones = construir_combinaciones(pool_pilotos, pool_ct)
+    if todas_combinaciones.empty:
         st.error("No se pudieron construir combinaciones piloto-coche.")
         return
     # =========================================================
     # 4) BANDA EQUILIBRADA DE COMBINACIONES
     # =========================================================
     # Queremos combinaciones fuertes pero compactas
-    df_combo = df_combo[
-        (df_combo['score_combo'] >= 0.52) &
-        (df_combo['score_combo'] <= 0.68)
+    df_combo = todas_combinaciones[
+        (todas_combinaciones['score_combo'] >= 0.52) &
+        (todas_combinaciones['score_combo'] <= 0.68)
     ].copy()
     if len(df_combo) < 8:
         # Si quedó demasiado estrecho, abrimos un poco
-        df_combo = pd.DataFrame(combinaciones)
-        df_combo = df_combo[
-            (df_combo['score_combo'] >= 0.50) &
-            (df_combo['score_combo'] <= 0.72)
+        df_combo = todas_combinaciones[
+            (todas_combinaciones['score_combo'] >= 0.50) &
+            (todas_combinaciones['score_combo'] <= 0.72)
         ].copy()
     if len(df_combo) < 8:
         st.error("No hay suficientes combinaciones equilibradas tras filtrar.")
@@ -843,11 +748,8 @@ def cargar_8_pilotos_equilibrados():
     centro_combo = df_combo['score_combo'].median()
     df_combo['dist_centro_combo'] = (df_combo['score_combo'] - centro_combo).abs()
     # Penalizar ligeramente pilotos que aparecen demasiadas veces en combinaciones válidas
-    freq_piloto = df_combo['piloto'].value_counts().to_dict()
-    max_freq = max(freq_piloto.values()) if freq_piloto else 1
-    df_combo['penalizacion_repeticion_piloto'] = df_combo['piloto'].map(
-        lambda p: 0.025 * (freq_piloto.get(p, 1) / max_freq)
-    )
+    freq_piloto = df_combo['piloto'].value_counts()
+    df_combo['penalizacion_repeticion_piloto'] = 0.025 * (df_combo['piloto'].map(freq_piloto) / freq_piloto.max())
     # Score ajustado: mantenemos equilibrio, pero favorecemos variedad de nombres
     df_combo['score_variedad'] = (
         df_combo['dist_centro_combo'] + df_combo['penalizacion_repeticion_piloto']
@@ -869,29 +771,10 @@ def cargar_8_pilotos_equilibrados():
         .reset_index(drop=True)
     )
     candidatos = candidatos.sample(frac=1, random_state=int(rng.integers(0, 1_000_000))).reset_index(drop=True)
-    for _, row in candidatos.iterrows():
-        if row['piloto'] in pilotos_usados:
-            continue
-        if row['constructor'] in constructores_usados:
-            continue
-        seleccion_final.append(row)
-        pilotos_usados.add(row['piloto'])
-        constructores_usados.add(row['constructor'])
-        if len(seleccion_final) == 8:
-            break
+    elegir_sin_repetir(candidatos, seleccion_final, pilotos_usados, constructores_usados)
     # Fallback si no salió suficiente
     if len(seleccion_final) < 8:
-        candidatos = df_combo.reset_index(drop=True)
-        for _, row in candidatos.iterrows():
-            if row['piloto'] in pilotos_usados:
-                continue
-            if row['constructor'] in constructores_usados:
-                continue
-            seleccion_final.append(row)
-            pilotos_usados.add(row['piloto'])
-            constructores_usados.add(row['constructor'])
-            if len(seleccion_final) == 8:
-                break
+        elegir_sin_repetir(df_combo, seleccion_final, pilotos_usados, constructores_usados)
     if len(seleccion_final) < 8:
         st.error("No se pudieron seleccionar 8 combinaciones únicas piloto-coche.")
         return
@@ -920,6 +803,71 @@ def cargar_10_circuitos_aleatorios():
         st.session_state[f"circuito_{i}"] = circuito
         st.session_state[f"lluvia_{i}"] = int(rng.choice([0, 1]))
 
+def simular_siguiente_carrera(circuito, lluvia, neutro):
+    pilotos_config = st.session_state.pilotos_config
+    df_qualy_features = generar_features_qualy(pilotos_config, circuito)
+    if df_qualy_features.empty:
+        st.error("No se ha podido generar la clasificación: ningún piloto tiene datos válidos.")
+        return
+    X_qualy = df_qualy_features.drop(columns="PILOTO")
+    preds = model_qualy.predict_proba(X_qualy)
+    # Factor de peso para escudería
+    factor_ct = 0.2  # más peso => mayor efecto del rendimiento de escudería
+    scores = []
+    for prob, piloto, ct_perf in zip(preds, df_qualy_features["PILOTO"], df_qualy_features["CT_QUALY_PERFORMANCE"]):
+        base = sum(p * w for p, w in zip(prob, PONDERACIONES))
+        ajuste = base * (1 + factor_ct * ct_perf)
+        scores.append((ajuste, piloto))
+    scores_ordenados = sorted(scores, reverse=True)
+    grid = [p for _, p in scores_ordenados]  # lista final ordenada por rendimiento
+    resultados = simular_carrera(pilotos_config, circuito, lluvia, grid, neutro)
+    if not resultados:
+        st.error("No se ha podido simular la carrera: ningún piloto tiene datos válidos.")
+        return
+
+    st.subheader(f"🔢 Clasificación en {circuito}")
+    base_ajuste = scores_ordenados[0][0]
+    for i, (ajuste, piloto) in enumerate(scores_ordenados, start=1):
+        tiempo_dif = (base_ajuste - ajuste) * 0.001  # cada punto = 0.001 segundos
+        if i == 1:
+            st.write(f"**P{i}**: {piloto} — 0.000 s")
+        else:
+            st.write(f"**P{i}**: {piloto} — +{tiempo_dif:.3f} s")
+    # Registrar pole
+    poleman = grid[0]
+    st.session_state.poles[poleman] = st.session_state.poles.get(poleman, 0) + 1
+
+    st.subheader(f"🏆 Resultado carrera en {circuito}")
+    clasificacion_antes = dict(st.session_state.resultados_mundial)
+    base_score = resultados[0][0]  # puntuación del ganador (referencia)
+    resultados_dict = []
+    for i, (score, piloto) in enumerate(resultados, start=1):
+        puntos_asignados = PUNTOS_F1[i-1] if i <= len(PUNTOS_F1) else 0
+        tiempo = (base_score - score) * 0.5  # conversión a segundos
+        if i == 1:
+            st.write(f"{i}. {piloto} — 0.00 s")
+        else:
+            st.write(f"{i}. {piloto} — +{tiempo:.2f} s")
+        st.session_state.resultados_mundial[piloto] = st.session_state.resultados_mundial.get(piloto, 0) + puntos_asignados
+        resultados_dict.append({
+            "piloto": piloto,
+            "salida": grid.index(piloto) + 1,
+            "llegada": i,
+            "puntos_f1": puntos_asignados,
+            "score_modelo": score
+        })
+    ganador = resultados[0][1]
+    st.session_state.victorias[ganador] = st.session_state.victorias.get(ganador, 0) + 1
+    # === Guardar resultados carrera + estado del mundial ===
+    st.session_state.historial_carreras.append({
+        "circuito": circuito,
+        "lluvia": bool(lluvia),
+        "resultados": resultados_dict,
+        "clasificacion_antes": clasificacion_antes,
+        "clasificacion_despues": dict(st.session_state.resultados_mundial)
+    })
+    st.session_state.carrera_actual += 1
+
 # --- Interfaz de usuario ---
 
 st.title("🏁 Simulador Histórico Mini-Mundial F1")
@@ -928,8 +876,6 @@ st.markdown("""
 If you no longer go for a gap that exists, you are no longer a racing driver
 </p>
 """, unsafe_allow_html=True)
-driverrefs = sorted(df_drivers['DRIVERREF'].unique())
-constructorrefs = sorted(df_constructors['NAME#'].dropna().unique())
 st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
 st.header("1. Selección de pilotos y escuderías")
@@ -950,7 +896,10 @@ with col2:
     st.markdown('</div>', unsafe_allow_html=True)
 driverrefs = sorted(df_drivers['DRIVERREF'].dropna().unique())
 constructorrefs = sorted(df_constructors['NAME#'].dropna().unique())
+anios_por_piloto = calcular_anios_validos("DRIVER_ID")
+anios_por_constructor = calcular_anios_validos("CONSTRUCTOR_ID")
 st.session_state.pilotos_config = {}
+pilotos_seleccionados = []
 for i in range(8):
     st.markdown(f"### Piloto {i+1}")
     # PILOTO y AÑO
@@ -958,39 +907,25 @@ for i in range(8):
     with col_piloto:
         piloto = st.selectbox(f"Piloto {i+1}", driverrefs, key=f"piloto_select_{i}")
     with col_anio:
-        driver_id = df_drivers[df_drivers['DRIVERREF'] == piloto]['DRIVER_ID'].iloc[0]
-        years_piloto_race = set(
-            df_race[df_race['DRIVER_ID'] == driver_id]['RACE_DATE'].dt.year.dropna().astype(int).unique()
-        )
-        years_piloto_qualy = set(
-            df_qualy[df_qualy['DRIVER_ID'] == driver_id]['GP_DATE'].dt.year.dropna().astype(int).unique()
-        )
-        years_piloto = sorted(list(years_piloto_race.intersection(years_piloto_qualy)))
-        if not years_piloto:
-            years_piloto = [2012]
+        years_piloto = anios_por_piloto.get(driver_id_por_ref[piloto]) or [2012]
         anio_piloto = st.selectbox(f"Año piloto {i+1}", years_piloto, key=f"anio_piloto_select_{i}")
     # ESCUDERÍA y AÑO
     col_esc, col_gap2, col_anio_esc, col_rest2 = st.columns([1.35, 0.05, 0.78, 2.10])
     with col_esc:
         constructor = st.selectbox(f"Escudería {i+1}", constructorrefs, key=f"constructor_select_{i}")
     with col_anio_esc:
-        constructor_id = df_constructors[df_constructors['NAME#'] == constructor]['CONSTRUCTOR_ID'].iloc[0]
-        years_constructor_race = set(
-            df_race[df_race['CONSTRUCTOR_ID'] == constructor_id]['RACE_DATE'].dt.year.dropna().astype(int).unique()
-        )
-        years_constructor_qualy = set(
-            df_qualy[df_qualy['CONSTRUCTOR_ID'] == constructor_id]['GP_DATE'].dt.year.dropna().astype(int).unique()
-        )
-        years_constructor = sorted(list(years_constructor_race.intersection(years_constructor_qualy)))
-        if not years_constructor:
-            years_constructor = [2012]
+        years_constructor = anios_por_constructor.get(constructor_id_por_nombre[constructor]) or [2012]
         anio_constructor = st.selectbox(f"Año escudería {i+1}", years_constructor, key=f"anio_constructor_select_{i}")
+    pilotos_seleccionados.append(piloto)
     st.session_state.pilotos_config[piloto] = {
         "anio_piloto": int(anio_piloto),
         "constructor": constructor,
         "anio_constructor": int(anio_constructor)
     }
     st.markdown("---")
+pilotos_repetidos = sorted({p for p in pilotos_seleccionados if pilotos_seleccionados.count(p) > 1})
+if pilotos_repetidos:
+    st.warning(f"⚠️ Hay pilotos repetidos: {', '.join(pilotos_repetidos)}. Cada piloto solo puede aparecer una vez para poder simular.")
 
 st.header("2. Define los 10 circuitos y si llueve")
 col_cal1, col_cal2 = st.columns([1, 4])
@@ -1013,7 +948,7 @@ for i in range(10):
         )
     with col_lluvia:
         lluvia = st.radio(
-            f"¿Llueve?",
+            "¿Llueve?",
             [0, 1],
             format_func=lambda x: "No" if x == 0 else "Sí",
             horizontal=True,
@@ -1030,19 +965,13 @@ if guardar_calendario:
     st.session_state.calendario = calendario_temporal
     st.success("Calendario guardado correctamente")
 if resetear_mundial:
-    st.session_state.pilotos_config = {}
     st.session_state.calendario = []
     st.session_state.resultados_mundial = {}
     st.session_state.carrera_actual = 0
     st.session_state.poles = {}
     st.session_state.victorias = {}
     st.session_state.historial_carreras = []  # 🔁 limpia prompts anteriores
-    st.session_state.clasificacion_mundial = {}
     st.success("Estado reiniciado correctamente")
-if 'modo_seleccion' not in st.session_state:
-    st.session_state.modo_seleccion = "Manual"
-if 'seed_aleatoria' not in st.session_state:
-    st.session_state.seed_aleatoria = 42
 if st.button("🎙️ Generar presentación de pilotos y equipos"):
     prompt_presentacion = generar_prompt_presentacion(st.session_state.pilotos_config)
     st.text_area("Prompt para GPT (Presentación previa al mundial)", prompt_presentacion, height=400)
@@ -1050,104 +979,19 @@ simulacion_neutra = st.checkbox("Simular mundial sin ajustes", value=False)
 if st.button("Simular siguiente carrera"):
     if not st.session_state.calendario:
         st.warning("Primero guarda el calendario con el botón '📅 Guardar calendario'")
+    elif pilotos_repetidos:
+        st.error("No se puede simular con pilotos repetidos. Cambia la selección en el apartado 1.")
     elif st.session_state.carrera_actual < len(st.session_state.calendario):
         circuito, lluvia = st.session_state.calendario[st.session_state.carrera_actual]
-        df_qualy_features = generar_features_qualy(st.session_state.pilotos_config, circuito)
-        X_qualy = df_qualy_features.drop(columns="PILOTO")
-        preds = model_qualy.predict_proba(X_qualy)
-        ponderaciones = [0, 25, 18, 15, 12, 10, 8, 6, 4]
-# Factor de peso para escudería
-        factor_ct = 0.2  # más peso => mayor efecto del rendimiento de escudería
-        scores = []
-        for prob, piloto, ct_perf in zip(preds, df_qualy_features["PILOTO"], df_qualy_features["CT_QUALY_PERFORMANCE"]):
-            base = sum(p * w for p, w in zip(prob, ponderaciones))
-            ajuste = base * (1 + factor_ct * ct_perf)
-            scores.append((ajuste, piloto))
-        grid = [p for _, p in sorted(scores, reverse=True)]
-        st.subheader(f"🔢 Clasificación en {circuito}")
-# Ordenar por puntuación (ya calculada previamente)
-        scores_ordenados = sorted(scores, reverse=True)
-        base_ajuste = scores_ordenados[0][0]
-        grid = [p for _, p in scores_ordenados]  # lista final ordenada por rendimiento
-        for i, (ajuste, piloto) in enumerate(scores_ordenados, start=1):
-            tiempo_dif = (base_ajuste - ajuste) * 0.001  # cada punto = 0.1 segundos
-            if i == 1:
-                st.write(f"**P{i}**: {piloto} — 0.000 s")
-            else:
-                    st.write(f"**P{i}**: {piloto} — +{tiempo_dif:.3f} s")
-# Registrar pole
-        if grid:
-            poleman = grid[0]
-            st.session_state.poles[poleman] = st.session_state.poles.get(poleman, 0) + 1
-        # ✅ Simulación y debug
-        resultados = simular_carrera(st.session_state.pilotos_config, circuito, lluvia, grid,simulacion_neutra)
-        #st.markdown("### 🧪 Debug de afinidad lluvia real por piloto")
-        #st.dataframe(pd.DataFrame(debug_info))
-        st.subheader(f"🏆 Resultado carrera en {circuito}")
-        puntos_f1 = [10, 8, 6, 5, 4, 3, 2, 1]
-        base_score = resultados[0][0]  # puntuación del ganador (referencia)
-        for i, (score, piloto) in enumerate(resultados, start=1):
-            puntos_asignados = puntos_f1[i-1] if i <= 8 else 0
-            tiempo = (base_score - score) * 0.5  # conversión a segundos
-            if i == 1:
-                st.write(f"{i}. {piloto} — 0.00 s")
-            else:
-                st.write(f"{i}. {piloto} — +{tiempo:.2f} s")
-            st.session_state.resultados_mundial[piloto] = st.session_state.resultados_mundial.get(piloto, 0) + puntos_asignados
-        if resultados:
-            ganador = resultados[0][1]
-            st.session_state.victorias[ganador] = st.session_state.victorias.get(ganador, 0) + 1
-        # === Guardar resultados carrera + estado del mundial ===
-            resultados_dict = []
-            for i, (score, piloto) in enumerate(resultados, start=1):
-                salida = grid.index(piloto) + 1
-                llegada = i
-                puntos_f1_asignados = puntos_f1[i-1] if i <= 8 else 0
-                resultados_dict.append({
-                    "piloto": piloto,
-                    "salida": salida,
-                    "llegada": llegada,
-                    "puntos_f1": puntos_f1_asignados,
-                    "score_modelo": score
-                })
-# Clasificación antes de carrera
-            clasificacion_antes = dict(st.session_state.resultados_mundial)
-# Actualizar clasificación (ya actualizada arriba, usamos dict de referencia)
-            clasificacion_despues = dict(st.session_state.resultados_mundial)
-# Guardar datos de carrera en historial
-            if 'historial_carreras' not in st.session_state:
-                st.session_state.historial_carreras = []
-            if 'clasificacion_mundial' not in st.session_state:
-                st.session_state.clasificacion_mundial = {}
-# Actualizar clasificación "oficial" paralela
-            for r in resultados_dict:
-                piloto = r['piloto']
-                st.session_state.clasificacion_mundial[piloto] = st.session_state.clasificacion_mundial.get(piloto, 0) + r['puntos_f1']
-            st.session_state.historial_carreras.append({
-                "circuito": circuito,
-                "lluvia": bool(lluvia),
-                "resultados": resultados_dict,
-                "clasificacion_antes": clasificacion_antes,
-                "clasificacion_despues": clasificacion_despues
-            })
-        st.session_state.carrera_actual += 1
+        simular_siguiente_carrera(circuito, lluvia, simulacion_neutra)
     else:
-        st.success("🏁 Mundial finalizado")
-#if st.button("📜 Generar crónica (copiar prompt para GPT)"):
-                #ultima = st.session_state.historial_carreras[-1]
-                #prompt = generar_prompt_para_gpt(ultima)
-                #st.text_area("Prompt para GPT:", prompt, height=400)
-#st.header("📊 Clasificación General")
-#clasificacion = sorted(st.session_state.resultados_mundial.items(), key=lambda x: x[1], reverse=True)
-#for i, (piloto, puntos) in enumerate(clasificacion, start=1):
-    #st.write(f"{i}. {piloto} — {puntos} puntos")
+        st.info("El mundial ya ha terminado. Pulsa '🔄 Resetear Mundial' para empezar otro.")
 if st.session_state.historial_carreras:
     ultima = st.session_state.historial_carreras[-1]
     prompt = generar_prompt_para_gpt(ultima)
     st.text_area("📝 Prompt generado", prompt, height=400)
-    url_gpt = "https://chatgpt.com/g/g-6824ad0751a481918919c57574db29b3-narrador-f1"  # 🔁 usa tu link real
     st.markdown(f"""
-        👉 [Abrir mi GPT personalizado y pegar el prompt]({url_gpt})
+        👉 [Abrir mi GPT personalizado y pegar el prompt]({URL_GPT})
         ⚠️ Asegúrate de haber copiado el prompt de arriba antes de ir.
     """)
 
@@ -1168,11 +1012,9 @@ else:
             "Poles": st.session_state.poles.get(piloto, 0),
             "Victorias": st.session_state.victorias.get(piloto, 0)
         })
-    if resumen_mundial:
-        st.dataframe(pd.DataFrame(resumen_mundial).sort_values("Puntos", ascending=False))
-    else:
-        st.info("ℹ️ Aún no hay resultados para mostrar.")
-if st.session_state.carrera_actual >= len(st.session_state.calendario):
+    df_resumen = pd.DataFrame(resumen_mundial).astype({"Año Piloto": "string", "Año Escudería": "string"})
+    st.dataframe(df_resumen.sort_values("Puntos", ascending=False))
+if st.session_state.calendario and st.session_state.carrera_actual >= len(st.session_state.calendario):
     st.success("🏁 Mundial finalizado")
     clasificacion_final = sorted(
         st.session_state.resultados_mundial.items(),
@@ -1184,8 +1026,6 @@ if st.session_state.carrera_actual >= len(st.session_state.calendario):
         campeon_config = st.session_state.pilotos_config.get(campeon, {})
         escuderia = campeon_config.get("constructor", "unknown")
         st.markdown(f"🎉 **¡El campeón del mundial es {campeon.replace('_', ' ').title()} con {escuderia.title()}!** 🏆")
-        import os
-        from PIL import Image
         ruta_piloto = os.path.join("images", f"{campeon}.jpg")
         ruta_logo = os.path.join("logos", f"{escuderia}.jpg")
         col1, col2 = st.columns(2)
